@@ -36,6 +36,16 @@ const emptyTactic = () => ({
 const emptyGoal = () => ({ id: crypto.randomUUID(), title: "", tactics: [emptyTactic()] });
 const defaultMemberData = () => ({ goals: [emptyGoal()] });
 
+// ── Debounce hook ─────────────────────────────────────────────────────────────
+function useDebounce(value, delay) {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(timer);
+  }, [value, delay]);
+  return debounced;
+}
+
 // ── Scoring ───────────────────────────────────────────────────────────────────
 function getTargetDays(tactic) {
   if (tactic.freqType === "days")
@@ -63,25 +73,6 @@ function calcScore(tactics, upToWeek) {
     }
   });
   return target === 0 ? null : Math.round((done / target) * 100);
-}
-
-// ── Smooth text input — local state, saves on blur ────────────────────────────
-function SmoothInput({ value, onChange, onBlur, placeholder, style, multiline, rows }) {
-  const [local, setLocal] = useState(value);
-  // Keep local in sync if parent value changes (e.g. real-time update from another user)
-  const prevValue = useRef(value);
-  useEffect(() => {
-    if (prevValue.current !== value) { setLocal(value); prevValue.current = value; }
-  }, [value]);
-
-  const props = {
-    value: local,
-    onChange: e => { setLocal(e.target.value); onChange && onChange(e.target.value); },
-    onBlur: () => onBlur && onBlur(local),
-    placeholder,
-    style,
-  };
-  return multiline ? <textarea {...props} rows={rows || 2} /> : <input {...props} />;
 }
 
 // ── Components ────────────────────────────────────────────────────────────────
@@ -241,46 +232,61 @@ function WeekGrid({ tactic, currentWeek, memberColor, onToggle, t }) {
   );
 }
 
-function MemberCard({ member, memberData, currentWeek, isEditing, onUpdate, onSave, onNameChange, onNameSave, t }) {
-  const goals = memberData.goals || [emptyGoal()];
+// ── MemberCard: fully self-contained local state, saves debounced ─────────────
+function MemberCard({ member, memberData, currentWeek, isEditing, onSave, onNameSave, t }) {
+  // Keep a fully local copy of all data while editing
+  const [localData, setLocalData] = useState(memberData);
+  const [localName, setLocalName] = useState(member.name);
+
+  // Sync from parent only when NOT editing (e.g. another user's update comes in)
+  useEffect(() => {
+    if (!isEditing) {
+      setLocalData(memberData);
+      setLocalName(member.name);
+    }
+  }, [isEditing, memberData, member.name]);
+
+  // Debounced values — only save to Supabase 800ms after the user stops typing
+  const debouncedData = useDebounce(localData, 800);
+  const debouncedName = useDebounce(localName, 800);
+
+  // Trigger save when debounced values change (only while editing)
+  const isEditingRef = useRef(isEditing);
+  useEffect(() => { isEditingRef.current = isEditing; }, [isEditing]);
+
+  useEffect(() => {
+    if (isEditingRef.current) {
+      onSave(debouncedData);
+    }
+  }, [debouncedData]);
+
+  useEffect(() => {
+    if (isEditingRef.current) {
+      onNameSave(debouncedName);
+    }
+  }, [debouncedName]);
+
+  const goals = localData.goals || [emptyGoal()];
   const overallScore = calcScore(goals.flatMap(g => g.tactics), currentWeek);
 
-  // These update local state only (no DB hit)
-  const addGoal = () => onUpdate({ ...memberData, goals: [...goals, emptyGoal()] });
-  const removeGoal = gid => onUpdate({ ...memberData, goals: goals.filter(g => g.id !== gid) });
-
-  const updateGoalTitle = (gid, title) =>
-    onUpdate({ ...memberData, goals: goals.map(g => g.id === gid ? { ...g, title } : g) });
-  const saveGoalTitle = (gid, title) =>
-    onSave({ ...memberData, goals: goals.map(g => g.id === gid ? { ...g, title } : g) });
-
+  const addGoal = () => setLocalData(d => ({ ...d, goals: [...d.goals, emptyGoal()] }));
+  const removeGoal = gid => setLocalData(d => ({ ...d, goals: d.goals.filter(g => g.id !== gid) }));
+  const updateGoalField = (gid, field, val) =>
+    setLocalData(d => ({ ...d, goals: d.goals.map(g => g.id === gid ? { ...g, [field]: val } : g) }));
   const addTactic = gid =>
-    onUpdate({ ...memberData, goals: goals.map(g => g.id === gid ? { ...g, tactics: [...g.tactics, emptyTactic()] } : g) });
+    setLocalData(d => ({ ...d, goals: d.goals.map(g => g.id === gid ? { ...g, tactics: [...g.tactics, emptyTactic()] } : g) }));
   const removeTactic = (gid, tid) =>
-    onUpdate({ ...memberData, goals: goals.map(g => g.id === gid ? { ...g, tactics: g.tactics.filter(t2 => t2.id !== tid) } : g) });
-
-  const updateTacticText = (gid, tid, text) =>
-    onUpdate({ ...memberData, goals: goals.map(g => g.id === gid ? { ...g, tactics: g.tactics.map(t2 => t2.id === tid ? { ...t2, text } : t2) } : g) });
-  const saveTacticText = (gid, tid, text) =>
-    onSave({ ...memberData, goals: goals.map(g => g.id === gid ? { ...g, tactics: g.tactics.map(t2 => t2.id === tid ? { ...t2, text } : t2) } : g) });
-
-  // Freq/check changes save immediately (no typing involved)
-  const updateTactic = (gid, tid, updated) => {
-    const newData = { ...memberData, goals: goals.map(g => g.id === gid ? { ...g, tactics: g.tactics.map(t2 => t2.id === tid ? updated : t2) } : g) };
-    onUpdate(newData);
-    onSave(newData);
-  };
-  const toggleDay = (gid, tid, week, day) => {
-    const newData = {
-      ...memberData, goals: goals.map(g => g.id === gid ? {
+    setLocalData(d => ({ ...d, goals: d.goals.map(g => g.id === gid ? { ...g, tactics: g.tactics.filter(t2 => t2.id !== tid) } : g) }));
+  const updateTactic = (gid, tid, updated) =>
+    setLocalData(d => ({ ...d, goals: d.goals.map(g => g.id === gid ? { ...g, tactics: g.tactics.map(t2 => t2.id === tid ? updated : t2) } : g) }));
+  const toggleDay = (gid, tid, week, day) =>
+    setLocalData(d => ({
+      ...d, goals: d.goals.map(g => g.id === gid ? {
         ...g, tactics: g.tactics.map(t2 => t2.id === tid ? {
-          ...t2, checks: t2.checks.map((wk, wi) => wi === week ? wk.map((d, di) => di === day ? !d : d) : wk)
+          ...t2, checks: t2.checks.map((wk, wi) => wi === week ? wk.map((dv, di) => di === day ? !dv : dv) : wk)
         } : t2)
       } : g)
-    };
-    onUpdate(newData);
-    onSave(newData);
-  };
+    }));
 
   const inputBase = {
     width: "100%", background: t.inputBg, border: `1px solid ${t.inputBorder}`,
@@ -301,17 +307,17 @@ function MemberCard({ member, memberData, currentWeek, isEditing, onUpdate, onSa
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 8, height: 8, borderRadius: "50%", background: member.color, boxShadow: `0 0 6px ${member.color}` }} />
           {isEditing ? (
-            <SmoothInput
-              value={member.name}
-              onChange={name => onNameChange(name)}
-              onBlur={name => onNameSave(name)}
+            <input
+              value={localName}
+              onChange={e => setLocalName(e.target.value)}
               style={{
                 background: "transparent", border: "none", borderBottom: `1px solid ${member.color}`,
-                color: t.text, fontSize: 15, fontWeight: 700, fontFamily: "'Sora', sans-serif", width: 150, outline: "none",
+                color: t.text, fontSize: 15, fontWeight: 700, fontFamily: "'Sora', sans-serif",
+                width: 150, outline: "none",
               }}
             />
           ) : (
-            <span style={{ fontSize: 15, fontWeight: 700, color: t.text }}>{member.name}</span>
+            <span style={{ fontSize: 15, fontWeight: 700, color: t.text }}>{localName}</span>
           )}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -345,12 +351,11 @@ function MemberCard({ member, memberData, currentWeek, isEditing, onUpdate, onSa
               {isEditing ? (
                 <div style={{ marginBottom: 14 }}>
                   <label style={{ fontSize: 10, color: t.textFaint, textTransform: "uppercase", letterSpacing: 1, display: "block", marginBottom: 5 }}>My Goal</label>
-                  <SmoothInput
+                  <textarea
                     value={goal.title}
-                    onChange={title => updateGoalTitle(goal.id, title)}
-                    onBlur={title => saveGoalTitle(goal.id, title)}
+                    onChange={e => updateGoalField(goal.id, "title", e.target.value)}
                     placeholder="What is your goal this 12-week cycle?"
-                    multiline rows={2}
+                    rows={2}
                     style={{ ...inputBase, resize: "vertical" }}
                   />
                 </div>
@@ -385,10 +390,9 @@ function MemberCard({ member, memberData, currentWeek, isEditing, onUpdate, onSa
                         )}
                       </div>
                       {isEditing ? (
-                        <SmoothInput
+                        <input
                           value={tactic.text}
-                          onChange={text => updateTacticText(goal.id, tactic.id, text)}
-                          onBlur={text => saveTacticText(goal.id, tactic.id, text)}
+                          onChange={e => updateTactic(goal.id, tactic.id, { ...tactic, text: e.target.value })}
                           placeholder="What habit are you tracking? e.g. Walk 30 min daily"
                           style={{ ...inputBase, marginBottom: 10 }}
                         />
@@ -446,6 +450,29 @@ function WeekSelector({ currentWeek, setCurrentWeek, t }) {
   );
 }
 
+// ── Settings member name input with local state ───────────────────────────────
+function SettingsMemberNameInput({ value, onSave, t }) {
+  const [local, setLocal] = useState(value);
+  useEffect(() => { setLocal(value); }, [value]);
+  const debounced = useDebounce(local, 800);
+  const mounted = useRef(false);
+  useEffect(() => {
+    if (!mounted.current) { mounted.current = true; return; }
+    onSave(debounced);
+  }, [debounced]);
+  return (
+    <input
+      value={local}
+      onChange={e => setLocal(e.target.value)}
+      style={{
+        flex: 1, background: t.inputBg, border: `1px solid ${t.inputBorder}`,
+        borderRadius: 10, color: t.text, padding: "8px 12px",
+        fontSize: 13, outline: "none", fontFamily: "'Sora', sans-serif",
+      }}
+    />
+  );
+}
+
 // ── Main App ──────────────────────────────────────────────────────────────────
 export default function App() {
   const [members, setMembers] = useState([]);
@@ -464,8 +491,12 @@ export default function App() {
   });
 
   const t = darkMode ? DARK : LIGHT;
+  const editingIdRef = useRef(editingId);
+  useEffect(() => { editingIdRef.current = editingId; }, [editingId]);
 
-  useEffect(() => { localStorage.setItem("wam-theme", darkMode ? "dark" : "light"); }, [darkMode]);
+  useEffect(() => {
+    localStorage.setItem("wam-theme", darkMode ? "dark" : "light");
+  }, [darkMode]);
 
   useEffect(() => {
     async function loadData() {
@@ -500,6 +531,8 @@ export default function App() {
       .on("postgres_changes", { event: "*", schema: "public", table: "members" }, payload => {
         if (payload.eventType === "UPDATE") {
           const m = payload.new;
+          // Never overwrite state for the member currently being edited
+          if (editingIdRef.current === m.id) return;
           setMembers(prev => prev.map(mb => mb.id === m.id ? { ...mb, name: m.name, color: m.color } : mb));
           setMemberDataMap(prev => ({ ...prev, [m.id]: m.tracker_data }));
         }
@@ -533,27 +566,6 @@ export default function App() {
     setTimeout(() => setSettingsSaved(false), 2000);
   };
 
-  // Update local state only (no DB) — for smooth typing
-  const updateMemberDataLocal = (mid, newData) => {
-    setMemberDataMap(prev => ({ ...prev, [mid]: newData }));
-  };
-
-  // Save to DB — called on blur or non-text interactions
-  const saveMemberDataNow = (mid, newData) => {
-    setMemberDataMap(prev => ({ ...prev, [mid]: newData }));
-    const member = members.find(m => m.id === mid);
-    if (member) saveMemberData(mid, member.name, member.color, newData);
-  };
-
-  const updateMemberName = (mid, name) => {
-    setMembers(prev => prev.map(m => m.id === mid ? { ...m, name } : m));
-  };
-  const saveMemberName = (mid, name) => {
-    setMembers(prev => prev.map(m => m.id === mid ? { ...m, name } : m));
-    const data = memberDataMap[mid] || defaultMemberData();
-    const member = members.find(m => m.id === mid);
-    if (member) saveMemberData(mid, name, member.color, data);
-  };
   const updateMemberColor = (mid, color) => {
     setMembers(prev => prev.map(m => m.id === mid ? { ...m, color } : m));
     const data = memberDataMap[mid] || defaultMemberData();
@@ -643,10 +655,15 @@ export default function App() {
                   memberData={memberDataMap[member.id] || defaultMemberData()}
                   currentWeek={currentWeek}
                   isEditing={editingId === member.id}
-                  onUpdate={d => updateMemberDataLocal(member.id, d)}
-                  onSave={d => saveMemberDataNow(member.id, d)}
-                  onNameChange={name => updateMemberName(member.id, name)}
-                  onNameSave={name => saveMemberName(member.id, name)}
+                  onSave={newData => {
+                    setMemberDataMap(prev => ({ ...prev, [member.id]: newData }));
+                    saveMemberData(member.id, member.name, member.color, newData);
+                  }}
+                  onNameSave={name => {
+                    setMembers(prev => prev.map(m => m.id === member.id ? { ...m, name } : m));
+                    const data = memberDataMap[member.id] || defaultMemberData();
+                    saveMemberData(member.id, name, member.color, data);
+                  }}
                   t={t}
                 />
                 <div style={{ position: "absolute", top: 10, right: 12, display: "flex", gap: 6, alignItems: "center" }}>
@@ -753,13 +770,15 @@ export default function App() {
                         onChange={e => updateMemberColor(m.id, e.target.value)}
                         style={{ width: 34, height: 34, border: "none", borderRadius: 8, cursor: "pointer", background: "none" }}
                       />
-                      <input value={m.name} onChange={e => updateMemberName(m.id, e.target.value)}
-                        onBlur={e => saveMemberName(m.id, e.target.value)}
-                        style={{
-                          flex: 1, background: t.inputBg, border: `1px solid ${t.inputBorder}`,
-                          borderRadius: 10, color: t.text, padding: "8px 12px",
-                          fontSize: 13, outline: "none", fontFamily: "'Sora', sans-serif",
-                        }} />
+                      <SettingsMemberNameInput
+                        value={m.name}
+                        onSave={name => {
+                          setMembers(prev => prev.map(mb => mb.id === m.id ? { ...mb, name } : mb));
+                          const data = memberDataMap[m.id] || defaultMemberData();
+                          saveMemberData(m.id, name, m.color, data);
+                        }}
+                        t={t}
+                      />
                       {members.length > 1 && (
                         <button onClick={() => removeMember(m.id)} style={{
                           background: "none", border: `1px solid ${t.border2}`, borderRadius: 8,
